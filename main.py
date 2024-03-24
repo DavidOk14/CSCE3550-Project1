@@ -1,76 +1,184 @@
-from cryptography.hazmat.backends import default_backend
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+from urllib.parse import urlparse, parse_qs
+import base64
+import json
 import jwt
+import datetime
+import sqlite3
 
-app = Flask(__name__)
+hostName = "localhost"
+serverPort = 8080
 
-# Generate keys
 private_key = rsa.generate_private_key(
     public_exponent=65537,
     key_size=2048,
-    backend=default_backend()
 )
-public_key = private_key.public_key()
+expired_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
 
-# Key IDs (KID_2 is the expired key, KID_1 is valid)
-KID_1 = "key_1"
-KID_2 = "key_2"
+pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
+expired_pem = expired_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
 
-# Expiration Times
-expire_1 = datetime.utcnow() + timedelta(days=1)    #valid time
-expire_2 = datetime.utcnow() - timedelta(days=1)    #expired time
+numbers = private_key.private_numbers()
 
-# Define keys
-keys = \
-    {
-    KID_1:
-        {
-        "kty": "RSA",
-        "kid": KID_1,
-        "n": str(public_key.public_numbers().n),
-        "e": str(public_key.public_numbers().e),
-        "exp": expire_1.isoformat()
-        },
+# Initialize DB
+conn = sqlite3.connect('totally_not_my_privateKeys.db')
+cursor = conn.cursor()
 
-    KID_2:
-        {
-        "kty": "RSA",
-        "kid": KID_2,
-        "n": str(public_key.public_numbers().n),
-        "e": str(public_key.public_numbers().e),
-        "exp": expire_2.isoformat(),
-        }
-}
+# Define table
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS keys(
+        kid INTEGER PRIMARY KEY AUTOINCREMENT,
+        key BLOB NOT NULL,
+        exp INTEGER NOT NULL
+    )
+''')
 
-#Send JWKS to proper route when the GET request is sent
-@app.route('/.well-known/jwks.json', methods=['GET'])
-def jwks():
-    return jsonify({"keys": list(keys.values())})
+# Place keys into the DB
+def insert_private_key(key, exp=None):
+    # Set the expire time -> place in DB
+    if exp is None:
+        exp = int(datetime.datetime.utcnow().timestamp()) + 3600
+    cursor.execute('''
+        INSERT INTO keys (key, exp) VALUES (?, ?)
+    ''', (key, exp))
+    conn.commit()
 
-#Auth endpoint for generating the JWTs
-@app.route("/auth", methods=['POST'])
-def auth():
-    #Start creating the data for the JWT to be tested against the JWK
-    if request.args.get("expired") == "true":
-        kid = KID_2
-        exp = -3600
-    else:
-        kid = KID_1
-        exp = datetime.utcnow() + timedelta(days=1)
+    # Verify key has been inserted
+    print(f"Inserted key with exp {exp}")
 
-    payload = {"name": "David O"}
+# Return expired keys from DB
+def get_private_keys():
+    cursor.execute('''
+        SELECT key, exp FROM keys WHERE exp >= ?
+    ''', (datetime.datetime.utcnow().timestamp(),))
+    return cursor.fetchall()
 
-    headers = {"kid": kid, "exp": exp}
+# Serialize private key with PEM format
+private_key_pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
+insert_private_key(private_key_pem)
 
-    #Encode JWT and return it
-    token = jwt.encode(payload, private_key, algorithm='RS256', headers=headers)
+# Serialize expired key with PEM format
+expired_key_pem = expired_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption()
+)
 
-    return jsonify({"token": token})
+# GET endpoint will now return the expired private keys
+keys = get_private_keys()
+
+# Close database connection when server is shut down
+def close_db_connection():
+    cursor.close()
+    conn.close()
+
+def int_to_base64(value):
+    """Convert an integer to a Base64URL-encoded string"""
+    value_hex = format(value, 'x')
+    # Ensure even length
+    if len(value_hex) % 2 == 1:
+        value_hex = '0' + value_hex
+    value_bytes = bytes.fromhex(value_hex)
+    encoded = base64.urlsafe_b64encode(value_bytes).rstrip(b'=')
+    return encoded.decode('utf-8')
+
+
+class MyServer(BaseHTTPRequestHandler):
+    def do_PUT(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_PATCH(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_DELETE(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_HEAD(self):
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        params = parse_qs(parsed_path.query)
+        if parsed_path.path == "/auth":
+            headers = {
+                "kid": "goodKID"
+            }
+            token_payload = {
+                "user": "username",
+                "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+            }
+            if 'expired' in params:
+                keys = get_private_keys()
+                expired_key_pem, expired_exp = keys[0]
+                expired_exp = int(datetime.datetime.utcnow().timestamp()) - 3600
+                insert_private_key(expired_key_pem, expired_exp)
+                headers["kid"] = "expiredKID"
+                token_payload["exp"] = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
+            encoded_jwt = jwt.encode(token_payload, pem, algorithm="RS256", headers=headers)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(bytes(encoded_jwt, "utf-8"))
+            return
+
+        self.send_response(405)
+        self.end_headers()
+        return
+
+    def do_GET(self):
+        if self.path == "/.well-known/jwks.json":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            keys = {
+                "keys": [
+                    {
+                        "alg": "RS256",
+                        "kty": "RSA",
+                        "use": "sig",
+                        "kid": "goodKID",
+                        "n": int_to_base64(numbers.public_numbers.n),
+                        "e": int_to_base64(numbers.public_numbers.e),
+                    }
+                ]
+            }
+            self.wfile.write(bytes(json.dumps(keys), "utf-8"))
+            return
+
+        self.send_response(405)
+        self.end_headers()
+        return
 
 
 if __name__ == "__main__":
+    webServer = HTTPServer((hostName, serverPort), MyServer)
+    try:
+        webServer.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
-    #Run the program on port 8080 of localhost
-    app.run(port=8080)
+    webServer.server_close()
